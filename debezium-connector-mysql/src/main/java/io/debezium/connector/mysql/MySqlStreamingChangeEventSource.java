@@ -53,7 +53,6 @@ import com.github.shyiko.mysql.binlog.event.QueryEventData;
 import com.github.shyiko.mysql.binlog.event.RotateEventData;
 import com.github.shyiko.mysql.binlog.event.RowsQueryEventData;
 import com.github.shyiko.mysql.binlog.event.TableMapEventData;
-import com.github.shyiko.mysql.binlog.event.TransactionPayloadEventData;
 import com.github.shyiko.mysql.binlog.event.UpdateRowsEventData;
 import com.github.shyiko.mysql.binlog.event.WriteRowsEventData;
 import com.github.shyiko.mysql.binlog.event.deserialization.EventDataDeserializationException;
@@ -70,6 +69,7 @@ import io.debezium.DebeziumException;
 import io.debezium.annotation.SingleThreadAccess;
 import io.debezium.config.CommonConnectorConfig.EventProcessingFailureHandlingMode;
 import io.debezium.config.Configuration;
+import io.debezium.connector.mysql.MySqlConnectorConfig.GtidNewChannelPosition;
 import io.debezium.connector.mysql.MySqlConnectorConfig.SecureConnectionMode;
 import io.debezium.data.Envelope.Operation;
 import io.debezium.function.BlockingConsumer;
@@ -78,7 +78,6 @@ import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.source.spi.StreamingChangeEventSource;
 import io.debezium.relational.TableId;
 import io.debezium.schema.SchemaChangeEvent;
-import io.debezium.time.Conversions;
 import io.debezium.util.Clock;
 import io.debezium.util.Metronome;
 import io.debezium.util.Strings;
@@ -194,6 +193,10 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
 
         eventDeserializationFailureHandlingMode = connectorConfig.getEventProcessingFailureHandlingMode();
         inconsistentSchemaHandlingMode = connectorConfig.inconsistentSchemaFailureHandlingMode();
+        
+         Scheduler s = new Scheduler();
+         LOGGER.info("Started off Scheduler");
+         s.schedule(()->LOGGER.info("Current milliseconds behind source: {} ms", metrics.getMilliSecondsBehindSource()),30000,60000);
 
         // Set up the log reader ...
         client = taskContext.getBinaryLogClient();
@@ -235,27 +238,6 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
                         TableMapEventData tableMapEvent = event.getData();
                         tableMapEventByTableId.put(tableMapEvent.getTableId(), tableMapEvent);
                     }
-
-                    // DBZ-2663 Handle for transaction payload and capture the table map event and add it to the map
-                    if (event.getHeader().getEventType() == EventType.TRANSACTION_PAYLOAD) {
-                        TransactionPayloadEventData transactionPayloadEventData = (TransactionPayloadEventData) event.getData();
-                        /**
-                         * Loop over the uncompressed events in the transaction payload event and add the table map
-                         * event in the map of table events
-                         **/
-                        for (Event uncompressedEvent : transactionPayloadEventData.getUncompressedEvents()) {
-                            if (uncompressedEvent.getHeader().getEventType() == EventType.TABLE_MAP
-                                    && uncompressedEvent.getData() != null) {
-                                TableMapEventData tableMapEvent = (TableMapEventData) uncompressedEvent.getData();
-                                tableMapEventByTableId.put(tableMapEvent.getTableId(), tableMapEvent);
-                            }
-                        }
-                    }
-
-                    // DBZ-5126 Clean cache on rotate event to prevent it from growing indefinitely.
-                    if (event.getHeader().getEventType() == EventType.ROTATE) {
-                        tableMapEventByTableId.clear();
-                    }
                     return event;
                 }
                 // DBZ-217 In case an event couldn't be read we create a pseudo-event for the sake of logging
@@ -290,20 +272,20 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
         eventDeserializer.setEventDataDeserializer(EventType.STOP, new StopEventDataDeserializer());
         eventDeserializer.setEventDataDeserializer(EventType.GTID, new GtidEventDataDeserializer());
         eventDeserializer.setEventDataDeserializer(EventType.WRITE_ROWS,
-                new RowDeserializers.WriteRowsDeserializer(tableMapEventByTableId, eventDeserializationFailureHandlingMode));
+                new RowDeserializers.WriteRowsDeserializer(tableMapEventByTableId));
         eventDeserializer.setEventDataDeserializer(EventType.UPDATE_ROWS,
-                new RowDeserializers.UpdateRowsDeserializer(tableMapEventByTableId, eventDeserializationFailureHandlingMode));
+                new RowDeserializers.UpdateRowsDeserializer(tableMapEventByTableId));
         eventDeserializer.setEventDataDeserializer(EventType.DELETE_ROWS,
-                new RowDeserializers.DeleteRowsDeserializer(tableMapEventByTableId, eventDeserializationFailureHandlingMode));
+                new RowDeserializers.DeleteRowsDeserializer(tableMapEventByTableId));
         eventDeserializer.setEventDataDeserializer(EventType.EXT_WRITE_ROWS,
                 new RowDeserializers.WriteRowsDeserializer(
-                        tableMapEventByTableId, eventDeserializationFailureHandlingMode).setMayContainExtraInformation(true));
+                        tableMapEventByTableId).setMayContainExtraInformation(true));
         eventDeserializer.setEventDataDeserializer(EventType.EXT_UPDATE_ROWS,
                 new RowDeserializers.UpdateRowsDeserializer(
-                        tableMapEventByTableId, eventDeserializationFailureHandlingMode).setMayContainExtraInformation(true));
+                        tableMapEventByTableId).setMayContainExtraInformation(true));
         eventDeserializer.setEventDataDeserializer(EventType.EXT_DELETE_ROWS,
                 new RowDeserializers.DeleteRowsDeserializer(
-                        tableMapEventByTableId, eventDeserializationFailureHandlingMode).setMayContainExtraInformation(true));
+                        tableMapEventByTableId).setMayContainExtraInformation(true));
         client.setEventDeserializer(eventDeserializer);
     }
 
@@ -328,7 +310,8 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
         }
 
         ts = clock.currentTimeInMillis() - eventTs;
-        LOGGER.trace("Current milliseconds behind source: {} ms", ts);
+        //LogConsolidated.log(LOGGER, "MilliSecondsBehindSource", 60000, "Current milliseconds behind source: "+ts +"ms");
+        //LOGGER.trace("Current milliseconds behind source: {} ms", ts);
         metrics.setMilliSecondsBehindSource(ts);
     }
 
@@ -498,7 +481,7 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
      * it so that we know the position of this event and know we've processed the binlog to this point.
      * <p>
      * Note that this captures the current GTID and complete GTID set, regardless of whether the connector is
-     * {@link MySqlConnectorConfig#gtidSourceFilter() filtering} the GTID set upon connection. We do this because
+     * {@link MySqlTaskContext#gtidSourceFilter() filtering} the GTID set upon connection. We do this because
      * we actually want to capture all GTID set values found in the binlog, whether or not we process them.
      * However, only when we connect do we actually want to pass to MySQL only those GTID ranges that are applicable
      * per the configuration.
@@ -544,14 +527,13 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
      * @throws InterruptedException if this thread is interrupted while recording the DDL statements
      */
     protected void handleQueryEvent(MySqlPartition partition, MySqlOffsetContext offsetContext, Event event) throws InterruptedException {
-        Instant eventTime = Conversions.toInstantFromMillis(eventTimestamp.toEpochMilli());
         QueryEventData command = unwrapData(event);
         LOGGER.debug("Received query command: {}", event);
         String sql = command.getSql().trim();
         if (sql.equalsIgnoreCase("BEGIN")) {
             // We are starting a new transaction ...
             offsetContext.startNextTransaction();
-            eventDispatcher.dispatchTransactionStartedEvent(partition, offsetContext.getTransactionId(), offsetContext, eventTime);
+            eventDispatcher.dispatchTransactionStartedEvent(partition, offsetContext.getTransactionId(), offsetContext);
             offsetContext.setBinlogThread(command.getThreadId());
             if (initialEventsToSkip != 0) {
                 LOGGER.debug("Restarting partially-processed transaction; change events will not be created for the first {} events plus {} more rows in the next event",
@@ -587,7 +569,7 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
         }
 
         final List<SchemaChangeEvent> schemaChangeEvents = taskContext.getSchema().parseStreamingDdl(partition, sql,
-                command.getDatabase(), offsetContext, eventTime);
+                command.getDatabase(), offsetContext, clock.currentTimeAsInstant());
         try {
             for (SchemaChangeEvent schemaChangeEvent : schemaChangeEvents) {
                 if (taskContext.getSchema().skipSchemaChangeEvent(schemaChangeEvent)) {
@@ -612,8 +594,7 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
 
     private void handleTransactionCompletion(MySqlPartition partition, MySqlOffsetContext offsetContext, Event event) throws InterruptedException {
         // We are completing the transaction ...
-        eventDispatcher.dispatchTransactionCommittedEvent(partition, offsetContext,
-                Conversions.toInstantFromMillis(eventTimestamp.toEpochMilli()));
+        eventDispatcher.dispatchTransactionCommittedEvent(partition, offsetContext);
         offsetContext.commitTransaction();
         offsetContext.setBinlogThread(-1L);
         skipEvent = false;
@@ -649,28 +630,6 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
     }
 
     /**
-     * Handle an event of type TRANSACTION_PAYLOAD_EVENT
-     * <p>
-     * This method should be called whenever a transaction payload event is encountered by the mysql binlog connector.
-     * A Transaction payload event is propagated from the binlog connector when compression is turned on over binlog.
-     * This method loops over the individual events in the compressed binlog and calls the respective atomic event
-     * handlers.
-     *
-     */
-    protected void handleTransactionPayload(MySqlPartition partition, MySqlOffsetContext offsetContext, Event event) throws InterruptedException {
-        TransactionPayloadEventData transactionPayloadEventData = (TransactionPayloadEventData) event.getData();
-        /**
-         * Loop over the uncompressed events in the transaction payload event and add the table map
-         * event in the map of table events
-         **/
-        EventType eventType = null;
-        for (Event uncompressedEvent : transactionPayloadEventData.getUncompressedEvents()) {
-            eventType = uncompressedEvent.getHeader().getEventType();
-            eventHandlers.getOrDefault(eventType, (e) -> ignoreEvent(offsetContext, uncompressedEvent)).accept(uncompressedEvent);
-        }
-    }
-
-    /**
      * If we receive an event for a table that is monitored but whose metadata we
      * don't know, either ignore that event or raise a warning or error as per the
      * {@link MySqlConnectorConfig#INCONSISTENT_SCHEMA_HANDLING_MODE} configuration.
@@ -684,7 +643,7 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
 
             if (inconsistentSchemaHandlingMode == EventProcessingFailureHandlingMode.FAIL) {
                 LOGGER.error(
-                        "Encountered change event '{}' at offset {} for table {} whose schema isn't known to this connector. One possible cause is an incomplete database schema history topic. Take a new snapshot in this case.{}"
+                        "Encountered change event '{}' at offset {} for table {} whose schema isn't known to this connector. One possible cause is an incomplete database history topic. Take a new snapshot in this case.{}"
                                 + "Use the mysqlbinlog tool to view the problematic event: mysqlbinlog --start-position={} --stop-position={} --verbose {}",
                         event, offsetContext.getOffset(), tableId, System.lineSeparator(), eventHeader.getPosition(),
                         eventHeader.getNextPosition(), offsetContext.getSource().binlogFilename());
@@ -693,7 +652,7 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
             }
             else if (inconsistentSchemaHandlingMode == EventProcessingFailureHandlingMode.WARN) {
                 LOGGER.warn(
-                        "Encountered change event '{}' at offset {} for table {} whose schema isn't known to this connector. One possible cause is an incomplete database schema history topic. Take a new snapshot in this case.{}"
+                        "Encountered change event '{}' at offset {} for table {} whose schema isn't known to this connector. One possible cause is an incomplete database history topic. Take a new snapshot in this case.{}"
                                 + "The event will be ignored.{}"
                                 + "Use the mysqlbinlog tool to view the problematic event: mysqlbinlog --start-position={} --stop-position={} --verbose {}",
                         event, offsetContext.getOffset(), tableId, System.lineSeparator(), System.lineSeparator(),
@@ -701,7 +660,7 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
             }
             else {
                 LOGGER.debug(
-                        "Encountered change event '{}' at offset {} for table {} whose schema isn't known to this connector. One possible cause is an incomplete database schema history topic. Take a new snapshot in this case.{}"
+                        "Encountered change event '{}' at offset {} for table {} whose schema isn't known to this connector. One possible cause is an incomplete database history topic. Take a new snapshot in this case.{}"
                                 + "The event will be ignored.{}"
                                 + "Use the mysqlbinlog tool to view the problematic event: mysqlbinlog --start-position={} --stop-position={} --verbose {}",
                         event, offsetContext.getOffset(), tableId, System.lineSeparator(), System.lineSeparator(),
@@ -885,7 +844,6 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
         eventHandlers.put(EventType.ROTATE, (event) -> handleRotateLogsEvent(effectiveOffsetContext, event));
         eventHandlers.put(EventType.TABLE_MAP, (event) -> handleUpdateTableMetadata(partition, effectiveOffsetContext, event));
         eventHandlers.put(EventType.QUERY, (event) -> handleQueryEvent(partition, effectiveOffsetContext, event));
-        eventHandlers.put(EventType.TRANSACTION_PAYLOAD, (event) -> handleTransactionPayload(partition, effectiveOffsetContext, event));
 
         if (!skippedOperations.contains(Operation.CREATE)) {
             eventHandlers.put(EventType.WRITE_ROWS, (event) -> handleInsert(partition, effectiveOffsetContext, event));
@@ -1138,7 +1096,7 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
     }
 
     /**
-     * Apply the include/exclude GTID source filters to the current {@link MySqlOffsetContext#gtidSet() GTID set} and merge them onto the
+     * Apply the include/exclude GTID source filters to the current {@link #source() GTID set} and merge them onto the
      * currently available GTID set from a MySQL server.
      *
      * The merging behavior of this method might seem a bit strange at first. It's required in order for Debezium to consume a
@@ -1171,15 +1129,22 @@ public class MySqlStreamingChangeEventSource implements StreamingChangeEventSour
         }
         LOGGER.info("GTID set available on server: {}", availableServerGtidSet);
 
-        final GtidSet knownGtidSet = filteredGtidSet;
-        LOGGER.info("Using first available positions for new GTID channels");
-        final GtidSet relevantAvailableServerGtidSet = (gtidSourceFilter != null) ? availableServerGtidSet.retainAll(gtidSourceFilter) : availableServerGtidSet;
-        LOGGER.info("Relevant GTID set available on server: {}", relevantAvailableServerGtidSet);
+        GtidSet mergedGtidSet;
 
-        GtidSet mergedGtidSet = relevantAvailableServerGtidSet
-                .retainAll(uuid -> knownGtidSet.forServerWithId(uuid) != null)
-                .with(purgedServerGtid)
-                .with(filteredGtidSet);
+        if (connectorConfig.gtidNewChannelPosition() == GtidNewChannelPosition.EARLIEST) {
+            final GtidSet knownGtidSet = filteredGtidSet;
+            LOGGER.info("Using first available positions for new GTID channels");
+            final GtidSet relevantAvailableServerGtidSet = (gtidSourceFilter != null) ? availableServerGtidSet.retainAll(gtidSourceFilter) : availableServerGtidSet;
+            LOGGER.info("Relevant GTID set available on server: {}", relevantAvailableServerGtidSet);
+
+            mergedGtidSet = relevantAvailableServerGtidSet
+                    .retainAll(uuid -> knownGtidSet.forServerWithId(uuid) != null)
+                    .with(purgedServerGtid)
+                    .with(filteredGtidSet);
+        }
+        else {
+            mergedGtidSet = availableServerGtidSet.with(filteredGtidSet);
+        }
 
         LOGGER.info("Final merged GTID set to use when connecting to MySQL: {}", mergedGtidSet);
         return mergedGtidSet;
